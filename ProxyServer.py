@@ -85,14 +85,16 @@ def parse_target(target, headers):
     else:
         target = target.lstrip("/")
 
-    # Relative links inside a proxied page (e.g. /img/logo.png): use Referer
-    first = target.split("/", 1)[0]
-    if not absolute and "." not in first and first != "localhost":
+    # Relative links inside a proxied page (e.g. /s.js or /img/logo.png):
+    # the browser sends a Referer like http://localhost:8888/example.com,
+    # so the real host is the first path segment of the Referer.
+    # (Typing a new URL in the address bar sends no Referer.)
+    if not absolute:
         ref = headers.get("referer", "")
         if "://" in ref:
             ref_path = ref.split("://", 1)[1].partition("/")[2]
             ref_host = ref_path.split("/", 1)[0]
-            if ref_host:
+            if ref_host and target != ref_host and not target.startswith(ref_host + "/"):
                 target = ref_host + "/" + target
 
     hostport, _, rest = target.partition("/")
