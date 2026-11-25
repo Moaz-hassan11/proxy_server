@@ -3,9 +3,10 @@ import sys
 import os
 import hashlib
 import threading
+import tempfile
 
 if len(sys.argv) <= 1:
-    print('Usage : "python ProxyServer.py server_ip [port]"\n'
+    print('Usage : "python3 ProxyServer.py server_ip [port]"\n'
           '[server_ip : It is the IP Address Of Proxy Server]')
     sys.exit(2)
 
@@ -69,6 +70,14 @@ def parse_headers(head_text):
     return headers
 
 
+def looks_like_host(segment):
+    """Return True if segment resembles a hostname or host:port (e.g. example.com or localhost:9000)."""
+    if not segment:
+        return False
+    host_part = segment.split(":", 1)[0]
+    return "." in host_part or host_part == "localhost"
+
+
 def parse_target(target, headers):
     """
     Return (host, port, path) or None if the URL is invalid/unsupported.
@@ -84,17 +93,22 @@ def parse_target(target, headers):
         return None
     else:
         target = target.lstrip("/")
+        # URL typed after the proxy address, e.g. localhost:8888/https://site.com
+        if target.startswith("https://"):
+            return None
+        if target.startswith("http://"):
+            target = target[len("http://"):]
+            absolute = True
 
-    # Relative links inside a proxied page (e.g. /s.js or /img/logo.png):
-    # the browser sends a Referer like http://localhost:8888/example.com,
-    # so the real host is the first path segment of the Referer.
-    # (Typing a new URL in the address bar sends no Referer.)
+    # Relative links inside a proxied page (e.g. /s.png or /img/logo.png):
+    # only prepend the Referer's host when the first segment does not already look like a host.
     if not absolute:
         ref = headers.get("referer", "")
         if "://" in ref:
             ref_path = ref.split("://", 1)[1].partition("/")[2]
             ref_host = ref_path.split("/", 1)[0]
-            if ref_host and target != ref_host and not target.startswith(ref_host + "/"):
+            first_seg = target.split("/", 1)[0]
+            if ref_host and not looks_like_host(first_seg):
                 target = ref_host + "/" + target
 
     hostport, _, rest = target.partition("/")
@@ -111,10 +125,10 @@ def parse_target(target, headers):
 
 def fetch_from_server(method, host, port, path, headers, body):
     """Connect to the origin server, send the request, return the raw response."""
-    c = socket(AF_INET, SOCK_STREAM)                      # socket to the web server
+    c = socket(AF_INET, SOCK_STREAM)
     c.settimeout(TIMEOUT)
     try:
-        c.connect((host, port))                            # connect to port 80
+        c.connect((host, port))
         host_header = host if port == 80 else "%s:%d" % (host, port)
         req = "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n" % (
             method, path, host_header)
@@ -126,7 +140,7 @@ def fetch_from_server(method, host, port, path, headers, body):
         req += "\r\n"
         c.sendall(req.encode("iso-8859-1") + body)
 
-        response = b""                                     # read response into buffer
+        response = b""
         while True:
             chunk = c.recv(4096)
             if not chunk:
@@ -135,6 +149,19 @@ def fetch_from_server(method, host, port, path, headers, body):
         return response
     finally:
         c.close()
+
+
+def atomic_write_cache(cache_file, data):
+    """Write response bytes to a temporary file and atomically move into place."""
+    fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(data)
+        os.replace(tmp_path, cache_file)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def handle_client(tcpCliSock, addr):
@@ -162,7 +189,7 @@ def handle_client(tcpCliSock, addr):
                        "Invalid or unsupported URL (only http:// is supported).")
             return
         host, port, path = parsed
-        filename = host + path          # e.g. example.com/index.html
+        filename = host + path
         print("Requested:", filename)
 
         key = "%s:%d%s" % (host, port, path)
@@ -175,7 +202,7 @@ def handle_client(tcpCliSock, addr):
             if cached_path and os.path.exists(cached_path):
                 with open(cached_path, "rb") as f:
                     data = f.read()
-                tcpCliSock.sendall(data)    # cache hit: send stored response
+                tcpCliSock.sendall(data)
                 print("Read from cache:", key)
                 return
 
@@ -204,12 +231,10 @@ def handle_client(tcpCliSock, addr):
         # Send the response to the client
         tcpCliSock.sendall(response)
 
-        # Save to cache only successful GET responses
+        # Save to cache only HTTP 200 GET responses
         status = response.split(b"\r\n", 1)[0].split(b" ")
         if method == "GET" and len(status) > 1 and status[1] == b"200":
-            tmpFile = open(cache_file, "wb")
-            tmpFile.write(response)
-            tmpFile.close()
+            atomic_write_cache(cache_file, response)
             with cache_lock:
                 cache_index[key] = cache_file
             print("Cached as", cache_file)
@@ -218,7 +243,7 @@ def handle_client(tcpCliSock, addr):
         print("Error handling request:", e)
         send_error(tcpCliSock, 500, "Internal Server Error", "Proxy error.")
     finally:
-        tcpCliSock.close()          # close the client socket
+        tcpCliSock.close()
 
 
 # Create a server socket, bind it to a port and start listening
@@ -237,4 +262,4 @@ try:
 except KeyboardInterrupt:
     print("\nShutting down proxy...")
 finally:
-    tcpSerSock.close()              # close the server socket
+    tcpSerSock.close()
